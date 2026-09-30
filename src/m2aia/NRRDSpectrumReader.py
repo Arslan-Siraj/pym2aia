@@ -7,6 +7,7 @@ import SimpleITK as sitk
 from .nrrd.NRRDNormalization import SpectrumNormalization
 from .nrrd.NRRDImageNormalization import ImageNormalization
 from .nrrd.NRRDPooling import SpectralPooling
+from .nrrd.NRRDSpectralSelection import SpectralSelection
 from .nrrd.NRRDIntensityTransformation import IntensityTransformation
 from .nrrd.NRRDSmoothing import SpectralSmoothing
 from .nrrd.NRRDBaselineCorrection import BaselineCorrection
@@ -25,6 +26,7 @@ class NRRDSpectrumReader:
     """
     _NORMALIZATIONS = SpectrumNormalization.SUPPORTED
     _POOLING = SpectralPooling.SUPPORTED
+    _SPECTRAL_SELECTIONS = SpectralSelection.SUPPORTED
     _IMAGE_NORMALIZATIONS = ImageNormalization.SUPPORTED
     _INTENSITY_TRANSFORMATIONS = IntensityTransformation.SUPPORTED
     _BASELINE_CORRECTIONS = BaselineCorrection.SUPPORTED
@@ -39,6 +41,8 @@ class NRRDSpectrumReader:
         pooling="Maximum",
         image_normalization="None",
         chunk_size=250000,
+        spectral_selection="Nearest",
+        tolerance=0.0,
     ):
         self.nrrd_path = str(nrrd_path)
         self.image = None
@@ -50,6 +54,7 @@ class NRRDSpectrumReader:
         self.normalization = "None"
         self.pooling = "Maximum"
         self.image_normalization = "None"
+        self.spectral_selection = "Nearest"
 
         self.baseline_correction = "None"
         self.smoothing = "None"
@@ -64,6 +69,8 @@ class NRRDSpectrumReader:
         self.SetNormalization(normalization)
         self.SetPooling(pooling)
         self.SetImageNormalization(image_normalization)
+        self.SetSpectralSelection(spectral_selection)
+        self.SetTolerance(tolerance)
 
     @staticmethod
     def _value(value):
@@ -388,11 +395,68 @@ class NRRDSpectrumReader:
 
         self.pooling = strategy
 
+    def SetSpectralSelection(self, strategy):
+        strategy = self._value(strategy)
+
+        if strategy not in self._SPECTRAL_SELECTIONS:
+            raise ValueError(
+                f"Unsupported spectral selection '{strategy}'. "
+                f"Supported: {sorted(self._SPECTRAL_SELECTIONS)}"
+            )
+
+        self.spectral_selection = strategy
+
+    def GetSpectralSelection(self) -> str:
+        return self.spectral_selection
+
     def SetTolerance(self, tol):
+        tol = float(tol)
+
+        if not np.isfinite(tol) or tol < 0:
+            raise ValueError("Tolerance must be a finite value >= 0.")
+
         self.tolerance = np.float32(tol)
 
     def GetTolerance(self) -> np.float32:
         return self.tolerance
+
+    def GetNearestWavenumber(self, center) -> float:
+        self.CheckHandle()
+        return SpectralSelection.nearest_value(self.x_axis, center)
+
+    def _select_spectral_indices(self, center, tol=None, selection=None):
+        center = float(center)
+
+        if selection is None:
+            # Backward compatibility: the old GetArray(center, tol) API
+            # always meant tolerance-window selection.
+            strategy = "Window" if tol is not None else self.spectral_selection
+        else:
+            strategy = self._value(selection)
+
+        if strategy not in self._SPECTRAL_SELECTIONS:
+            raise ValueError(
+                f"Unsupported spectral selection '{strategy}'. "
+                f"Supported: {sorted(self._SPECTRAL_SELECTIONS)}"
+            )
+
+        tolerance = self.tolerance if tol is None else tol
+
+        return SpectralSelection.select_indices(
+            self.x_axis,
+            center,
+            strategy=strategy,
+            tolerance=tolerance,
+        )
+
+    def GetSelectedWavenumbers(self, center, tol=None, selection=None) -> np.ndarray:
+        self.CheckHandle()
+        indices = self._select_spectral_indices(
+            center,
+            tol=tol,
+            selection=selection,
+        )
+        return self.x_axis[indices].copy()
 
     def SetBaselineCorrection(self, strategy="None", half_window_size=50):
         strategy = self._value(strategy)
@@ -661,10 +725,19 @@ class NRRDSpectrumReader:
     def GetArray(
         self,
         center,
-        tol,
+        tol=None,
         dtype=np.float32,
         squeeze=False,
+        selection=None,
     ) -> np.ndarray:
+        """
+        Extract a spatial image around a requested wavenumber.
+
+        With no ``tol`` argument, the configured spectral-selection strategy
+        is used. The default strategy is ``Nearest``. Passing ``tol`` keeps
+        compatibility with the previous API and uses ``Window`` selection for
+        that call unless ``selection`` is given explicitly.
+        """
         self.CheckHandle()
 
         if dtype not in (np.float32, np.float64):
@@ -673,27 +746,11 @@ class NRRDSpectrumReader:
             )
 
         center = float(center)
-        tol = float(tol)
-
-        if center < np.min(self.x_axis) or center > np.max(self.x_axis):
-            raise ValueError(
-                f"Center {center} is outside x-axis range "
-                f"[{self.x_axis.min()}, {self.x_axis.max()}]."
-            )
-
-        selected_indices = np.flatnonzero(
-            (self.x_axis >= center - tol)
-            & (self.x_axis <= center + tol)
+        selected_indices = self._select_spectral_indices(
+            center,
+            tol=tol,
+            selection=selection,
         )
-
-        if selected_indices.size == 0:
-            nearest = int(
-                np.argmin(np.abs(self.x_axis - center))
-            )
-            raise ValueError(
-                f"No spectral channel found in [{center - tol}, {center + tol}]. "
-                f"Nearest channel is {self.x_axis[nearest]}."
-            )
 
         output = np.zeros(
             self.depth_z * self.height * self.width,
@@ -744,8 +801,9 @@ class NRRDSpectrumReader:
     def GetImage(
         self,
         center,
-        tol,
+        tol=None,
         dtype=np.float32,
+        selection=None,
     ) -> sitk.Image:
         image = sitk.GetImageFromArray(
             self.GetArray(
@@ -753,6 +811,7 @@ class NRRDSpectrumReader:
                 tol,
                 dtype=dtype,
                 squeeze=False,
+                selection=selection,
             )
         )
 
@@ -779,6 +838,8 @@ class NRRDSpectrumReader:
     def GetParametersAsFormattedString(self):
         s = ""
         s += f"(normalization {self.normalization})\n"
+        s += f"(spectral-selection {self.spectral_selection})\n"
+        s += f"(tolerance {float(self.tolerance)})\n"
         s += f"(pooling {self.pooling})\n"
         s += f"(image-normalization {self.image_normalization})\n"
         s += "(baseline-correction NotImplemented)\n"

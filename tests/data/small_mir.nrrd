@@ -1,0 +1,20 @@
+NRRD0004
+# Complete NRRD file format specification at:
+# http://teem.sourceforge.net/nrrd/format.html
+type: float
+dimension: 4
+space: left-posterior-superior
+sizes: 2 8 6 1
+space directions: none (0.0043383950000000001,0,0) (0,0.0043383950000000001,0) (0,0,0.01)
+kinds: vector domain domain domain
+endian: little
+encoding: raw
+space origin: (0,0,0)
+ITK_InputFilterName:=NrrdImageIO
+ITK_original_direction:=[UNKNOWN_PRINT_CHARACTERISTICS]\n
+ITK_original_spacing:=[UNKNOWN_PRINT_CHARACTERISTICS]\n
+Type:=1650.0,1690.0
+
+´š¯;‹­;3ÖK<çyM<¿é„<Åz~<[}<}<Ý¢Ö;ÿL€;ùk;¤ 4;}ãŸ:ŒiÞºg
+Ð9ñü»òçq7pGº[÷F;ìÆÙ:‹š;\!l;#Y:KÎ¥:¾”;X‡:ÝY;4e;˜Þƒ;Xn¬¹b,7;e/»²öº‡M»5=»3Úº×‚º[‰:‚‡:æã:’-#;Weå:cMu;S«;‹i;;½1;À2—9=£O»‘Œ[8Xµ:/ÞKº
+c!:Yt%ºl†&º§½(;îwð:õÆg;É!;óëß:ÿTÔ;Õ¨:O•”;j€6º¤Â º¯ÔÊ;â7¨;\?ª;Ö8;t*†;œù—:ã{ˆ;@lO9á[¹;ì×#;9X‹;KÄ;yî­;y;öA¢;6–w;ðf;ùaŠ; -Š:‡`‘;'§²:˜4;„;8“:|Ðï;¤å”º¤ìÔ;ÇO³º;;Ò;¤­:Ä¹ß;€k<
