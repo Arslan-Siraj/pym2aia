@@ -3,6 +3,7 @@ from .Generators import *
 from .Dataset import *
 from .utils import *
 from .Library import get_library
+from .NRRDSpectrumReader import *
 
 import os
 import logging
