@@ -91,16 +91,19 @@ class NRRDSpectrumReader:
 
         components = self.image.GetNumberOfComponentsPerPixel()
 
-        if components <= 1:
-            raise ValueError(
-                "Expected a vector NRRD with more than one spectral component per pixel."
-            )
+        if components < 1:
+            raise ValueError("NRRD has no pixel components.")
 
         data = sitk.GetArrayFromImage(self.image)
 
-        if data.ndim != 4:
+        # SimpleITK may expose a one-component spectral NRRD as a scalar
+        # [z, y, x] array. Add the spectral axis back so one-channel files
+        # written by WriteNRRD can be read again by this class.
+        if data.ndim == 3 and components == 1:
+            data = data[..., np.newaxis]
+        elif data.ndim != 4:
             raise ValueError(
-                "Expected SimpleITK vector-image layout [z, y, x, channels], "
+                "Expected NRRD array layout [z, y, x, channels], "
                 f"got {data.shape}."
             )
 
@@ -816,6 +819,223 @@ class NRRDSpectrumReader:
         )
 
         return self._copy_geometry(image)
+
+    @staticmethod
+    def _format_wavenumbers(values) -> str:
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        return ",".join(f"{float(value):.12g}" for value in values)
+
+    def _copy_output_metadata(self, output_image):
+        """Copy non-structural metadata from the source NRRD."""
+        for key in self.image.GetMetaDataKeys():
+            upper = key.upper()
+
+            # Geometry and vector structure are written by SimpleITK from the
+            # output image itself. Copying these fields can leave stale NRRD
+            # header information after selecting a different channel count.
+            if upper.startswith("NRRD_") or upper.startswith("ITK_"):
+                continue
+
+            try:
+                output_image.SetMetaData(key, self.image.GetMetaData(key))
+            except RuntimeError:
+                # Some image-IO-specific metadata cannot be written back.
+                continue
+
+        return output_image
+
+    def WriteNRRD(
+        self,
+        output_path,
+        wavenumbers=None,
+        dtype=np.float32,
+        selection=None,
+        tolerance=None,
+        use_compression=True,
+    ) -> pathlib.Path:
+        """
+        Write selected MIR channels as a new spectral NRRD.
+
+        The current spectrum normalization, spectral selection, pooling, and
+        image normalization settings are applied before writing. One, two, or
+        more requested wavenumbers are supported. Geometry is copied from the
+        source image.
+
+        Parameters
+        ----------
+        output_path : path-like
+            Destination ``.nrrd`` file.
+        wavenumbers : float or sequence of float, optional
+            Requested output channels. If omitted, all values in the current
+            x-axis are written.
+        dtype : numpy dtype
+            ``np.float32`` or ``np.float64``.
+        selection : {"Nearest", "Exact", "Window"}, optional
+            Selection strategy for this write operation. By default the
+            reader's currently configured strategy is used.
+        tolerance : float, optional
+            Window tolerance in cm^-1. By default the configured tolerance is
+            used.
+        use_compression : bool
+            Enable NRRD compression in SimpleITK.
+        """
+        self.CheckHandle()
+
+        if dtype not in (np.float32, np.float64):
+            raise TypeError(
+                "NRRD pixel type must be np.float32 or np.float64."
+            )
+
+        if wavenumbers is None:
+            requested = self.x_axis.astype(np.float64, copy=True)
+        elif np.isscalar(wavenumbers):
+            requested = np.asarray([wavenumbers], dtype=np.float64)
+        else:
+            requested = np.asarray(wavenumbers, dtype=np.float64)
+
+        requested = requested.reshape(-1)
+
+        if requested.size == 0:
+            raise ValueError("At least one wavenumber must be requested.")
+
+        if not np.all(np.isfinite(requested)):
+            raise ValueError("Requested wavenumbers must be finite.")
+
+        strategy = (
+            self.spectral_selection
+            if selection is None
+            else self._value(selection)
+        )
+
+        if strategy not in self._SPECTRAL_SELECTIONS:
+            raise ValueError(
+                f"Unsupported spectral selection '{strategy}'. "
+                f"Supported: {sorted(self._SPECTRAL_SELECTIONS)}"
+            )
+
+        tol = float(self.tolerance if tolerance is None else tolerance)
+
+        if not np.isfinite(tol) or tol < 0:
+            raise ValueError("Tolerance must be a finite value >= 0.")
+
+        channel_images = []
+        output_axis = []
+        selected_groups = []
+
+        for center in requested:
+            selected_indices = self._select_spectral_indices(
+                float(center),
+                tol=tol,
+                selection=strategy,
+            )
+            selected_values = self.x_axis[selected_indices].astype(
+                np.float64,
+                copy=True,
+            )
+            selected_groups.append(selected_values)
+
+            # A single selected channel has an unambiguous measured
+            # wavenumber. A pooled Window image is represented by its
+            # requested window center.
+            if selected_values.size == 1:
+                output_axis.append(float(selected_values[0]))
+            else:
+                output_axis.append(float(center))
+
+            channel_images.append(
+                self.GetArray(
+                    float(center),
+                    tol=tol,
+                    dtype=dtype,
+                    squeeze=False,
+                    selection=strategy,
+                )
+            )
+
+        output_data = np.stack(channel_images, axis=-1).astype(
+            dtype,
+            copy=False,
+        )
+
+        output_image = sitk.GetImageFromArray(
+            output_data,
+            isVector=True,
+        )
+        output_image = self._copy_geometry(output_image)
+        output_image = self._copy_output_metadata(output_image)
+
+        output_axis = np.asarray(output_axis, dtype=np.float64)
+        requested_text = self._format_wavenumbers(requested)
+        output_axis_text = self._format_wavenumbers(output_axis)
+        selected_text = ";".join(
+            self._format_wavenumbers(values)
+            for values in selected_groups
+        )
+
+        # Spectral metadata used by NRRDSpectrumReader and by MIR workflows.
+        output_image.SetMetaData("Modality", "MIR")
+        output_image.SetMetaData("SpectralUnit", "cm^-1")
+        output_image.SetMetaData("m2aia.modality", "MIR")
+        output_image.SetMetaData("m2aia.spectral_unit", "cm^-1")
+        output_image.SetMetaData("m2aia.xaxis", output_axis_text)
+        output_image.SetMetaData("m2aia_xaxis", output_axis_text)
+        output_image.SetMetaData("wavenumbers", output_axis_text)
+        output_image.SetMetaData("Type", output_axis_text)
+        output_image.SetMetaData("m2aia.xs", output_axis_text)
+        output_image.SetMetaData("m2aia.xs.n", str(output_axis.size))
+        output_image.SetMetaData(
+            "m2aia.xs.min",
+            str(float(np.min(output_axis))),
+        )
+        output_image.SetMetaData(
+            "m2aia.xs.max",
+            str(float(np.max(output_axis))),
+        )
+
+        # Record how this derived spectral NRRD was created.
+        output_image.SetMetaData(
+            "m2aia.processing.normalization",
+            str(self.normalization),
+        )
+        output_image.SetMetaData(
+            "m2aia.processing.spectral_selection",
+            strategy,
+        )
+        output_image.SetMetaData(
+            "m2aia.processing.tolerance_cm-1",
+            f"{tol:.12g}",
+        )
+        output_image.SetMetaData(
+            "m2aia.processing.pooling",
+            str(self.pooling),
+        )
+        output_image.SetMetaData(
+            "m2aia.processing.image_normalization",
+            str(self.image_normalization),
+        )
+        output_image.SetMetaData(
+            "m2aia.output.requested_wavenumbers",
+            requested_text,
+        )
+        output_image.SetMetaData(
+            "m2aia.output.selected_wavenumbers",
+            selected_text,
+        )
+        output_image.SetMetaData(
+            "m2aia.output.source",
+            str(self.path()),
+        )
+
+        output_path = pathlib.Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        sitk.WriteImage(
+            output_image,
+            str(output_path),
+            bool(use_compression),
+        )
+
+        return output_path
 
     def SpectrumIterator(self):
         self.CheckHandle()
